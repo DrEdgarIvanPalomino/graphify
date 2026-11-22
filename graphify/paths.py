@@ -53,6 +53,45 @@ def _out_from_env() -> str:
 GRAPHIFY_OUT = _out_from_env()
 
 
+# --- Per-file raw-bytes handoff between the cache-key hash and the parse read ---
+#
+# On a cold build each source file was read from disk twice: once by
+# cache.file_hash() to compute the SHA256 cache key, and again by
+# extractors.base._read_source_bytes() to parse it. The two live in different
+# call scopes (load_cached() runs before the extractor), so the bytes are passed
+# between them through this one-slot, context-local handoff: file_hash() stashes
+# the raw bytes it just read, and _read_source_bytes() consumes them for the same
+# path, halving cold-build file I/O. The cache-key value is unchanged — it is the
+# SHA256 of exactly these raw bytes, as before.
+#
+# A ContextVar, not a module global: extraction runs concurrently — a
+# ThreadPoolExecutor in tests, process pools in production — and each thread
+# starts with its own empty context, so a value stashed on one thread is never
+# visible to another (mirrors extractors.base._ACTIVE_SCAN_ROOT). Single slot and
+# keyed by path string: the last writer wins so memory stays bounded to one
+# file's bytes, and a key mismatch simply re-reads from disk — another file's
+# bytes can never be returned. On a warm build file_hash() takes its stat
+# fastpath and never reads, so nothing is stashed and no eager read is forced.
+from contextvars import ContextVar as _ContextVar
+
+_PREREAD_RAW: "_ContextVar[tuple[str, bytes] | None]" = _ContextVar(
+    "_PREREAD_RAW", default=None
+)
+
+
+def stash_preread_bytes(path: "str | Path", raw: bytes) -> None:
+    """Record ``raw`` as the just-read raw bytes of ``path`` for this context."""
+    _PREREAD_RAW.set((str(path), raw))
+
+
+def take_preread_bytes(path: "str | Path") -> "bytes | None":
+    """Return raw bytes stashed for ``path`` in this context, else ``None``."""
+    slot = _PREREAD_RAW.get()
+    if slot is not None and slot[0] == str(path):
+        return slot[1]
+    return None
+
+
 def os_long_path(path: "str | Path") -> str:
     r"""Return an OS path string safe for open()/stat() on Windows long paths.
 
@@ -463,6 +502,33 @@ def out_path(*parts: str) -> Path:
     ("graphify-out") and an absolute override ("/shared/graphify-out").
     """
     return Path(GRAPHIFY_OUT, *parts)
+
+
+def graph_root_for(gp: Path) -> Path:
+    """Resolve the selected graph's project without interpreting paths via CWD."""
+    try:
+        text = (gp.parent / ".graphify_root").read_text(encoding="utf-8-sig").strip()
+        if text:
+            root = Path(text)
+            if root.is_absolute():
+                try:
+                    resolved = root.resolve()
+                except RuntimeError:
+                    pass  # Path resolution can report a symlink loop this way.
+                else:
+                    if resolved.is_dir():
+                        return resolved
+    except (OSError, UnicodeError, ValueError):
+        pass
+
+    # CLI-written absolute markers cover shared output. Otherwise strip only
+    # an exact, traversal-free relative output suffix, never a CWD-resolved one.
+    output = Path(GRAPHIFY_OUT)
+    parts = output.parts
+    if (parts and not output.is_absolute() and ".." not in parts
+            and gp.parent.parts[-len(parts):] == parts):
+        return gp.parent.parents[len(parts) - 1]
+    return gp.parent
 
 
 def default_graph_json() -> str:
